@@ -1,0 +1,191 @@
+// Private-chat DOM selectors were informed by popohuan/douyin-bot (MIT).
+// See ATTRIBUTIONS.md. No third-party persona, account state, or sending code is used.
+import {createRequire} from 'node:module';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import {createHash, randomUUID} from 'node:crypto';
+import readline from 'node:readline';
+import {fileURLToPath,pathToFileURL} from 'node:url';
+import {sendReply} from './browser_actions.mjs';
+import {ConversationIdentities} from './conversation_identity.mjs';
+
+let context, page, settings, identities, identityFile;
+const hash=x=>createHash('sha256').update(x).digest('hex');
+const siteHost=host=>host==='douyin.com'||host.endsWith('.douyin.com')||host==='iesdouyin.com'||host.endsWith('.iesdouyin.com');
+const mediaHost=host=>siteHost(host)||['douyinvod.com','douyincdn.com','douyinpic.com','bytecdn.cn','byteimg.com','byteimgtos.com','pstatp.com'].some(x=>host===x||host.endsWith('.'+x));
+const publicURL=value=>{try{const u=new URL(value);return u.origin+u.pathname;}catch{return '';}};
+
+async function open(config) {
+  settings=config;
+  identityFile=path.join(config.profile,'conversation-identities.json');
+  let known={};
+  try { known=JSON.parse(await fs.readFile(identityFile,'utf8')); }
+  catch(error) { if(error.code!=='ENOENT')throw new Error('会话身份记录无法读取，请保留该文件并检查浏览器资料目录。'); }
+  identities=new ConversationIdentities(hash,publicURL,known,config.private_whitelist||[]);
+  if(config.restore_peer)identities.remember(config.restore_peer,config.restore_peer.key);
+  await fs.mkdir(config.profile,{recursive:true});
+  await saveIdentities();
+  if(context && page && !page.isClosed())return status();
+  const require=createRequire(config.playwright_package);
+  const {chromium}=require('playwright');
+  await fs.mkdir(config.profile,{recursive:true});
+  await fs.mkdir(config.media_dir,{recursive:true});
+  if(process.platform==='linux'&&!config.headless&&!process.env.DISPLAY&&!process.env.WAYLAND_DISPLAY)
+    throw new Error('当前主机没有图形桌面，无法打开扫码登录窗口。请为容器配置桌面或 VNC/X11。');
+  const options={headless:!!config.headless,viewport:{width:1280,height:900},acceptDownloads:true};
+  if(config.browser_channel)options.channel=config.browser_channel;
+  if(config.browser_executable)options.executablePath=config.browser_executable;
+  context=await chromium.launchPersistentContext(config.profile,options);
+  page=context.pages()[0] || await context.newPage();
+  page.setDefaultTimeout(8000);
+  await page.goto('https://www.douyin.com/',{waitUntil:'domcontentloaded',timeout:45000});
+  if(config.restore_peer){
+    try{
+      await page.locator('[data-e2e="im-entry"]').click({timeout:20000});
+      await page.locator('[data-e2e="conversation-item"]').first().waitFor({timeout:15000});
+      const listed=await snapshot({conversations_only:true});
+      const byID=config.restore_peer.conversation_id?(listed.conversations||[]).filter(
+        item=>item.conversation_id===config.restore_peer.conversation_id):[];
+      let match=byID.length===1;
+      if(match){
+        const {activateConversation}=await import('./conversation_ui.mjs');
+        await activateConversation(page,byID[0],snapshot);
+      }
+      else match=await page.evaluate(peer=>{
+        const clean=x=>{try{return new URL(x).pathname;}catch{return '';}};
+        const candidates=[...document.querySelectorAll('[data-e2e="conversation-item"]')]
+          .filter(x=>[...x.querySelectorAll('img')].some(i=>clean(i.src)===clean(peer.avatar))
+            &&(peer.conversation_id||x.innerText.split('\n').map(t=>t.trim()).includes(peer.name)));
+        if(candidates.length!==1)return false;
+        candidates[0].setAttribute('data-mimi-restore-peer','true');return true;
+      },config.restore_peer);
+      if(match){
+        if(byID.length!==1)await page.locator('[data-mimi-restore-peer="true"]').click();
+        await page.locator('.messageEditorinputArea').waitFor({timeout:10000});
+        let restored;
+        for(let i=0;i<6;i++){
+          restored=await snapshot();
+          if(restored.peer?.key===config.restore_peer.key)break;
+          await page.waitForTimeout(500);
+        }
+        if(restored.peer?.key!==config.restore_peer.key)return {...await status(),state:'restore_recipient_mismatch'};
+      }
+    }catch{/* Keep login available for manual selection when restoring is unavailable. */}
+  }
+  return status();
+}
+
+async function saveIdentities() {
+  if(!identities.dirty)return;
+  await fs.writeFile(identityFile+'.tmp',JSON.stringify(Object.fromEntries(identities.known)),'utf8');
+  await fs.rename(identityFile+'.tmp',identityFile);
+  identities.dirty=false;
+}
+
+async function status() {
+  if(!page || page.isClosed())return {open:false,logged_in:false,state:'browser_closed'};
+  const cookies=await context.cookies('https://www.douyin.com');
+  const session=cookies.some(x=>['sessionid','sessionid_ss'].includes(x.name)&&x.value);
+  const ui=await page.evaluate(()=>({title:document.title,url:location.origin+location.pathname,
+    editors:[...document.querySelectorAll('[contenteditable="true"],textarea')].filter(x=>x.getBoundingClientRect().width>20)
+      .map(x=>({tag:x.tagName,className:x.className,role:x.getAttribute('role')})).slice(0,8),
+    loginButton:[...document.querySelectorAll('button,[role="button"]')].some(x=>x.innerText?.trim()==='登录'&&x.getBoundingClientRect().width>10)}));
+  return {open:true,logged_in:session&&!ui.loginButton,state:session?'waiting_for_conversation':'login_required',...ui};
+}
+
+async function snapshot(options={}) {
+  if(!page || page.isClosed())throw new Error('请先打开浏览器，并登录机器人的抖音账号。');
+  const domFile=path.join(path.dirname(fileURLToPath(import.meta.url)),'dom.mjs');
+  const version=(await fs.stat(domFile)).mtimeMs;
+  const {readChatDOM}=await import(pathToFileURL(domFile).href+'?v='+version);
+  const data=await page.evaluate(readChatDOM,{debug:!!options.debug,conversations_only:!!options.conversations_only});
+  // Resolve the open chat first: its header can supply a legacy profile link
+  // missing from the list, and both must share the resolved key in this result.
+  if(data.ready){
+    const peer=data.peer;
+    const group=peer.conversation_type==='group';
+    if(group&&!peer.conversation_id)throw new Error('尚未取得稳定的群会话 ID，请打开群资料后重试绑定。');
+    peer.key=identities.key(peer);
+    identities.remember(peer,peer.key);
+    peer.identity_kind=peer.conversation_id?'conversation_id':peer.link?'profile_link':'name_and_avatar';
+    peer.link=publicURL(peer.link);peer.avatar=publicURL(peer.avatar);
+  }
+  for(const row of data.conversations||[]){
+    row.key=row.conversation_id?identities.key(row):'';
+    row.link=publicURL(row.link);row.avatar=publicURL(row.avatar);
+  }
+  await saveIdentities();
+  if(!data.ready)return data;
+  const group=data.peer.conversation_type==='group';
+  const duplicates=new Map();
+  for(const item of data.items) {
+    if(group&&item.sender_id&&!/^\d+$/.test(item.sender_id))item.sender_id='dy-member-'+hash(item.sender_id).slice(0,24);
+    // Never use the virtual-list index as the message identity: it shifts as new
+    // messages arrive. Python aligns repeated content with the previous snapshot.
+    item.fingerprint=hash(JSON.stringify([item.sender,item.text,item.links.map(publicURL),item.images.map(publicURL),item.kind,...(group?[item.sender_id]:[])]));
+    const occurrence=duplicates.get(item.fingerprint)||0;duplicates.set(item.fingerprint,occurrence+1);
+    item.key=item.native_id || item.fingerprint+':'+occurrence;
+    item.images=item.images.map(publicURL);
+  }
+  return data;
+}
+
+async function send(args) {
+  return sendReply(page,snapshot,args);
+}
+
+async function selectConversation(args) {
+  const list=await snapshot({conversations_only:true});
+  const matches=(list.conversations||[]).filter(item=>args.conversation_id?
+    item.conversation_id===args.conversation_id:item.name===args.name);
+  if(matches.length!==1)throw new Error(matches.length?'存在同名会话，请使用会话 ID 选择。':'当前列表未找到指定会话，请先在抖音消息列表中打开它。');
+  const {activateConversation}=await import('./conversation_ui.mjs');
+  return activateConversation(page,matches[0],snapshot);
+}
+
+async function download(args) {
+  const mediaFile=path.join(path.dirname(fileURLToPath(import.meta.url)),'media.mjs');
+  const version=(await fs.stat(mediaFile)).mtimeMs;
+  const {downloadVideo}=await import(pathToFileURL(mediaFile).href+'?v='+version);
+  return downloadVideo(args,{context,page,settings,snapshot,siteHost,mediaHost,publicURL});
+}
+
+async function postInfo(args) {
+  const {readPost}=await import('./post_media.mjs');
+  return await readPost({...args,info_only:true,probe_comment:true},{context,page,settings,snapshot,siteHost,mediaHost,publicURL});
+}
+
+async function explore(action,args) {
+  const {browsePost,publishComment}=await import('./explore.mjs');
+  const environment={context,page,settings,snapshot,siteHost,mediaHost,publicURL};
+  return await (action==='browse'?browsePost:publishComment)(args,environment);
+}
+
+const input=readline.createInterface({input:process.stdin});
+let queue=Promise.resolve();
+input.on('line',line=>{queue=queue.then(async()=>{
+  let request;
+  try {
+    request=JSON.parse(line);
+    const actions={open:()=>open(request.args),status,snapshot:()=>snapshot(request.args),conversations:()=>snapshot({conversations_only:true}),select_conversation:()=>selectConversation(request.args),send:()=>send(request.args),download:()=>download(request.args),post_info:()=>postInfo(request.args),
+      browse:()=>explore('browse',request.args),comment:()=>explore('comment',request.args),
+      configure:async()=>{
+        const limit=request.args.max_download_mb??settings.max_download_mb;
+        const durationLimit=request.args.max_video_duration_seconds??settings.max_video_duration_seconds??180;
+        if(!Number.isInteger(limit)||limit<1||limit>10000)throw new Error('作品下载大小上限应为 1～10000 MB。');
+        if(!Number.isInteger(durationLimit)||durationLimit<0||durationLimit>10000)throw new Error('视频时长上限应为 0～10000 秒。');
+        await fs.mkdir(request.args.media_dir,{recursive:true});
+        settings.media_dir=request.args.media_dir;settings.max_download_mb=limit;settings.max_video_duration_seconds=durationLimit;
+        return {media_dir:settings.media_dir,max_download_mb:settings.max_download_mb,max_video_duration_seconds:durationLimit};
+      },
+      close:async()=>{await context?.close();context=null;page=null;return {closed:true};}};
+    if(!actions[request.action])throw new Error('未知浏览器操作。');
+    const result=await actions[request.action]();
+    process.stdout.write(JSON.stringify({id:request.id,ok:true,result})+'\n');
+  } catch(error) {
+    // Do not put signed media URLs, cookies, or page HTML in logs.
+    const message=String(error.message||error).replace(/https?:\/\/\S+/g,'[URL]').slice(0,500);
+    process.stdout.write(JSON.stringify({id:request?.id,ok:false,error:message})+'\n');
+  }
+});});
+input.on('close',()=>{queue.finally(async()=>{await context?.close().catch(()=>{});process.exit(0);});});
